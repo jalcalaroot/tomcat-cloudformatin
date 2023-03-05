@@ -1,0 +1,334 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploys an EC2 with 
+Parameters:
+  KeyPair:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the container
+      instances
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: Must be a valid EC2 keypair.
+  LoadBalancerSubnets:
+    Description: Subnet(s) for the load balancer
+    Type: List<AWS::EC2::Subnet::Id>
+  SubnetId:
+    Type: 'AWS::EC2::Subnet::Id'
+    Description: Please enter the subnetId.
+    ConstraintDescription: must be a valid EC2 instance type.
+  InstanceType:
+    Type: String
+    Default: t3a.small
+    AllowedValues:
+      - t3a.xlarge
+      - t3a.medium
+      - t3a.2xlarge
+      - t3a.large
+      - t3a.small
+  AmiID:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Description: Query for the latest Amazon Linux AMI IDs using AWS Systems Manager Parameter Store
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+  VpcId:
+    Description: VPC ID for resources
+    Type: AWS::EC2::VPC::Id
+  Owner:
+    Description: Used to tag resources
+    Type: String
+  tomcatv:
+    Type: String
+    Description: Please enter the version of tomcat the best recomedation use de version default
+    Default: 9.0.67
+    AllowedValues:
+      - 8.5.82 
+      - 9.0.67
+      - 10.0.26 
+      - 10.1.0
+  tomcatuser:
+    Type: String
+    Description: Please Insert your user 
+    Default: tomcat
+  tomcatpasword:
+    Type: String
+    Description: Please Insert your pasword 
+    Default: tomcatword
+
+Resources:
+  JacksonSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${Owner}-HomelanderInstance-SG'
+      VpcId: !Ref VpcId
+      GroupDescription: Enable HTTP from the ApplicationLoadBalancer on dynamic ports
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${Owner}-JacksonSecurityGroup'
+        - Key: Owner
+          Value: !Sub '${Owner}'
+  Ec2SsmIamRole:
+    Type: AWS::IAM::Role
+    Properties: 
+      AssumeRolePolicyDocument: 
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ec2.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMFullAccess
+        - arn:aws:iam::aws:policy/CloudWatchFullAccess
+        - arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess
+      Policies:
+        - PolicyName: !Sub ${Owner}-sts-assume-role
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "sts:*"
+                Resource: "*"          
+
+  Ec2SsmInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: 
+      Path: /
+      Roles: [!Ref Ec2SsmIamRole]
+  JacksonInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiID
+      InstanceType: !Ref InstanceType
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: '30'
+            DeleteOnTermination: 'true'
+            Encrypted: 'true'
+      SecurityGroupIds:
+        - !Ref JacksonSecurityGroup
+      SubnetId: !Ref SubnetId
+      IamInstanceProfile: !Ref Ec2SsmInstanceProfile
+      UserData:
+        Fn::Base64: 
+          !Sub |
+            #!/bin/bash -xe 
+            exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+            sudo yum update -y && sudo yum upgrade -y
+            sudo yum install -y install wget
+            sudo amazon-linux-extras install java-openjdk11
+            sudo groupadd --system tomcat
+            sudo useradd -d /usr/share/tomcat -r -s /bin/false -g tomcat tomcat
+            wget https://archive.apache.org/dist/tomcat/tomcat-9/v'${tomcatv}'/bin/apache-tomcat-'${tomcatv}'.tar.gz
+            sudo tar xvf apache-tomcat-'${tomcatv}'.tar.gz -C /usr/share/
+            sudo ln -s /usr/share/apache-tomcat-'${tomcatv}'/ /usr/share/tomcat
+            sudo chown -R tomcat:tomcat /usr/share/tomcat
+            sudo chown -R tomcat:tomcat /usr/share/apache-tomcat-'${tomcatv}'/ 
+            sudo tee /etc/systemd/system/tomcat.service<<EOF
+            [Unit]
+            Description=Tomcat Server
+            After=syslog.target network.target
+            [Service]
+            Type=forking
+            User=tomcat
+            Group=tomcat
+            Environment=JAVA_HOME=/usr/lib/jvm/jre
+            Environment='JAVA_OPTS=-Djava.awt.headless=true'
+            Environment=CATALINA_HOME=/usr/share/tomcat
+            Environment=CATALINA_BASE=/usr/share/tomcat
+            Environment=CATALINA_PID=/usr/share/tomcat/temp/tomcat.pid
+            Environment='CATALINA_OPTS=-Xms512M -Xmx1024M'
+            ExecStart=/usr/share/tomcat/bin/catalina.sh start
+            ExecStop=/usr/share/tomcat/bin/catalina.sh stop
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+            sudo rm -rf /usr/share/tomcat/conf/tomcat-users.xml
+            sudo tee /usr/share/tomcat/conf/tomcat-users.xml<<EOF
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!--
+              Licensed to the Apache Software Foundation (ASF) under one or more
+              contributor license agreements.  See the NOTICE file distributed with
+              this work for additional information regarding copyright ownership.
+              The ASF licenses this file to You under the Apache License, Version 2.0
+              (the "License"); you may not use this file except in compliance with
+              the License.  You may obtain a copy of the License at
+
+                  http://www.apache.org/licenses/LICENSE-2.0
+
+              Unless required by applicable law or agreed to in writing, software
+              distributed under the License is distributed on an "AS IS" BASIS,
+              WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+              See the License for the specific language governing permissions and
+              limitations under the License.
+            -->
+            <tomcat-users xmlns="http://tomcat.apache.org/xml"
+                          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                          xsi:schemaLocation="http://tomcat.apache.org/xml tomcat-users.xsd"
+                          version="1.0">
+            <!--
+              By default, no user is included in the "manager-gui" role required
+              to operate the "/manager/html" web application.  If you wish to use this app,
+              you must define such a user - the username and password are arbitrary.
+
+              Built-in Tomcat manager roles:
+                - manager-gui    - allows access to the HTML GUI and the status pages
+                - manager-script - allows access to the HTTP API and the status pages
+                - manager-jmx    - allows access to the JMX proxy and the status pages
+                - manager-status - allows access to the status pages only
+
+              The users below are wrapped in a comment and are therefore ignored. If you
+              wish to configure one or more of these users for use with the manager web
+              application, do not forget to remove the <!.. ..> that surrounds them. You
+              will also need to set the passwords to something appropriate.
+            -->
+            <!--
+              <user username="admin" password="${tomcatpasword}" roles="manager-gui"/>
+              <user username="robot" password="${tomcatpasword}" roles="manager-script"/>
+            -->
+            <!--
+              The sample user and role entries below are intended for use with the
+              examples web application. They are wrapped in a comment and thus are ignored
+              when reading this file. If you wish to configure these users for use with the
+              examples web application, do not forget to remove the <!.. ..> that surrounds
+              them. You will also need to set the passwords to something appropriate.
+            -->
+            <!--
+              <role rolename="tomcat"/>
+              <role rolename="role1"/>
+              <user username="tomcat" password="${tomcatpasword}" roles="tomcat"/>
+              <user username="both" password="${tomcatpasword}" roles="tomcat,role1"/>
+              <user username="role1" password="${tomcatpasword}" roles="role1"/>
+            -->
+            <role rolename="admin-gui"/>
+            <role rolename="manager-gui"/>
+            <user username="${tomcatuser}" password="${tomcatpasword}" fullName="Administrator" roles="admin-gui,manager-gui"/>
+            </tomcat-users>
+            EOF
+            sudo mv /usr/share/tomcat/webapps/manager/META-INF/context.xml /usr/share/tomcat/webapps/manager/META-INF/context.xml.bck
+            sudo tee /usr/share/tomcat/webapps/manager/META-INF/context.xml<<EOF
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!--
+              Licensed to the Apache Software Foundation (ASF) under one or more
+              contributor license agreements.  See the NOTICE file distributed with
+              this work for additional information regarding copyright ownership.
+              The ASF licenses this file to You under the Apache License, Version 2.0
+              (the "License"); you may not use this file except in compliance with
+              the License.  You may obtain a copy of the License at
+
+                  http://www.apache.org/licenses/LICENSE-2.0
+                  
+              Unless required by applicable law or agreed to in writing, software
+              distributed under the License is distributed on an "AS IS" BASIS,
+              WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+              See the License for the specific language governing permissions and
+              limitations under the License.
+            -->
+            <Context antiResourceLocking="false" privileged="true" >
+              <CookieProcessor className="org.apache.tomcat.util.http.Rfc6265CookieProcessor"
+                              sameSiteCookies="strict" />
+            <!--
+              <Valve className="org.apache.catalina.valves.RemoteAddrValve"
+                    allow="127\.\d+\.\d+\.\d+|::1|0:0:0:0:0:0:0:1" />
+            -->
+            <Valve className="org.apache.catalina.valves.RemoteAddrValve"
+                    allow="\d+\.\d+\.\d+\.\d+" />
+              <Manager sessionAttributeValueClassNameFilter="java\.lang\.(?:Boolean|Integer|Long|Number|String)|org\.apache\.catalina\.filters\.CsrfPreventionFilter\$LruCache(?:\$1)?|java\.util\.(?:Linked)?HashMap"/>
+            </Context>
+            EOF
+            sudo systemctl daemon-reload
+            sudo systemctl start tomcat
+            sudo systemctl enable tomcat
+            
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-EC2'
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for the ApplicationLoadBalancer
+      VpcId:
+        Ref: VpcId
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: 8080
+        ToPort: 8080
+        CidrIp: 0.0.0.0/0
+      Tags:
+      - Key: Name
+        Value: ec2-inbound-access-to-loadbalancer
+      - Key: Owner
+        Value:
+          Ref: Owner
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      SecurityGroups:
+      - Ref: LoadBalancerSecurityGroup
+      Subnets:
+        Ref: LoadBalancerSubnets
+      Tags:
+      - Key: Owner
+        Value:
+          Ref: Owner
+  ApplicationLoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+      - Type: forward
+        TargetGroupArn:
+          Ref: NullTargetGroup
+      LoadBalancerArn:
+        Ref: ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  NullTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn:
+    - ApplicationLoadBalancer
+    Properties:
+      HealthCheckIntervalSeconds: 6
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      TargetType: instance
+      Port: 80
+      Protocol: HTTP
+      VpcId:
+        Ref: VpcId
+      Targets:
+        - Id: !Ref JacksonInstance
+          Port: 8080
+
+Outputs:
+  InstanceId:
+    Description: Jackson InstanceId
+    Value: !Ref 'JacksonInstance'
+    Export:
+      Name: !Sub '${Owner}-JacksonInstanceId'
+  SgId:
+    Description: JacksonInstance Security Group Id
+    Value: !Ref 'JacksonSecurityGroup'
